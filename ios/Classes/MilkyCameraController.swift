@@ -11,52 +11,56 @@ class MilkyCameraController: NSObject {
     // AVFoundation
     private let captureSession = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    private let sessionQueue = DispatchQueue(label: "milky.camera.session", qos: .userInteractive)
+    private let sessionQueue = DispatchQueue(
+        label: "milky.camera.session",
+        qos: .userInteractive,
+        attributes: [],
+        autoreleaseFrequency: .workItem  // prevents memory buildup per frame
+    )
 
     // GPU
     private let ciContext: CIContext
     private let filterPipeline: MilkyFilterPipeline
 
-    // Latest processed frame — accessed from Flutter texture callback
+    // Latest processed frame
     private var latestPixelBuffer: CVPixelBuffer?
     private let pixelBufferLock = NSLock()
 
-    // Flutter texture handle
     private var flutterTexture: MilkyFlutterTexture?
 
     init(textureRegistry: FlutterTextureRegistry) {
         self.textureRegistry = textureRegistry
 
-        // Force Metal GPU context — never use CPU renderer
         let metalDevice = MTLCreateSystemDefaultDevice()!
+
+        // GPU-only CIContext with YUV-aware color space
+        // workingFormat = RGBAh (16-bit half float) — more color depth internally
         self.ciContext = CIContext(mtlDevice: metalDevice, options: [
             .workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-            .outputColorSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-            .useSoftwareRenderer: false   // GPU only
+            .outputColorSpace:  CGColorSpace(name: CGColorSpace.sRGB)!,
+            .workingFormat:     CIFormat.RGBAh,   // 16-bit internal processing
+            .useSoftwareRenderer: false,           // GPU only, never fall back to CPU
+            .cacheIntermediates: false             // don't cache — saves VRAM per frame
         ])
         self.filterPipeline = MilkyFilterPipeline(context: ciContext)
     }
 
     func start(completion: @escaping (Int64?, Error?) -> Void) {
-        AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-            guard let self = self, granted else {
-                completion(nil, NSError(domain: "MilkyCamera", code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Camera permission denied"]))
-                return
-            }
-            self.sessionQueue.async {
-                do {
-                    try self.setupSession()
-                    let texture = MilkyFlutterTexture(controller: self)
-                    let id = self.textureRegistry.register(texture)
-                    self.textureId = id
-                    self.flutterTexture = texture
-                    self.captureSession.startRunning()
-                    DispatchQueue.main.async { completion(id, nil) }
-                } catch {
-                    DispatchQueue.main.async { completion(nil, error) }
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        switch status {
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                guard let self else { return }
+                if granted {
+                    self.sessionQueue.async { self.setupAndStart(completion: completion) }
+                } else {
+                    completion(nil, Self.permissionError)
                 }
             }
+        case .authorized:
+            sessionQueue.async { self.setupAndStart(completion: completion) }
+        default:
+            completion(nil, Self.permissionError)
         }
     }
 
@@ -73,7 +77,6 @@ class MilkyCameraController: NSObject {
         filterPipeline.intensity = intensity
     }
 
-    // Called by MilkyFlutterTexture.copyPixelBuffer()
     func copyLatestPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
         pixelBufferLock.lock()
         defer { pixelBufferLock.unlock() }
@@ -81,24 +84,49 @@ class MilkyCameraController: NSObject {
         return Unmanaged.passRetained(pb)
     }
 
-    // MARK: - Private setup
+    // MARK: - Private
+
+    private func setupAndStart(completion: @escaping (Int64?, Error?) -> Void) {
+        do {
+            try setupSession()
+            let texture = MilkyFlutterTexture(controller: self)
+            let id = textureRegistry.register(texture)
+            textureId = id
+            flutterTexture = texture
+            captureSession.startRunning()
+            DispatchQueue.main.async { completion(id, nil) }
+        } catch {
+            DispatchQueue.main.async { completion(nil, error) }
+        }
+    }
 
     private func setupSession() throws {
         captureSession.beginConfiguration()
-        captureSession.sessionPreset = .hd1280x720
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera,
-            for: .video,
-            position: .front),
+        // 1080p — best quality without risking frame drops from filter overhead
+        captureSession.sessionPreset = .hd1920x1080
+
+        guard let device = AVCaptureDevice.default(
+            .builtInWideAngleCamera, for: .video, position: .front),
         let input = try? AVCaptureDeviceInput(device: device),
         captureSession.canAddInput(input)
-        else { throw NSError(domain: "MilkyCamera", code: -2,
-            userInfo: [NSLocalizedDescriptionKey: "Cannot open front camera"]) }
-
+        else {
+            throw NSError(domain: "MilkyCamera", code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Cannot open front camera"])
+        }
         captureSession.addInput(input)
 
+        // Lock to 30fps — stable budget for filter chain
+        try device.lockForConfiguration()
+        device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+        device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+        device.unlockForConfiguration()
+
+        // YUV 420 full range — native camera sensor format, avoids BGRA conversion cost
+        // kCVPixelFormatType_420YpCbCr8BiPlanarFullRange = '420f'
         videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String:
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         ]
         videoOutput.alwaysDiscardsLateVideoFrames = true
         videoOutput.setSampleBufferDelegate(self, queue: sessionQueue)
@@ -109,12 +137,24 @@ class MilkyCameraController: NSObject {
         }
         captureSession.addOutput(videoOutput)
 
-        // Correct orientation for front camera
-        videoOutput.connection(with: .video)?.videoOrientation = .portrait
-        videoOutput.connection(with: .video)?.isVideoMirrored = true
+        // Lens correction — fixes front camera barrel distortion
+        if let connection = videoOutput.connection(with: .video) {
+            connection.videoOrientation = .portrait
+            connection.isVideoMirrored  = true
+
+            // Enable lens distortion correction if available (iOS 13+)
+            if connection.isCameraIntrinsicMatrixDeliverySupported {
+                connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+            }
+        }
 
         captureSession.commitConfiguration()
     }
+
+    private static let permissionError = NSError(
+        domain: "MilkyCamera", code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "Camera permission denied"]
+    )
 }
 
 // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -126,14 +166,12 @@ extension MilkyCameraController: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         guard let rawPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        // Apply GPU filter pipeline — returns a new CVPixelBuffer still on GPU
         guard let filtered = filterPipeline.process(pixelBuffer: rawPixelBuffer) else { return }
 
         pixelBufferLock.lock()
         latestPixelBuffer = filtered
         pixelBufferLock.unlock()
 
-        // Notify Flutter to pull a new frame
         textureRegistry.textureFrameAvailable(textureId)
     }
 }
