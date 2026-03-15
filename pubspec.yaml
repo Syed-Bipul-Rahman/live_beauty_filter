@@ -1,6 +1,6 @@
 name: live_beauty_filter
 description: "A Flutter plugin for iOS that applies a real-time milky/soft beauty filter to the live camera feed, entirely on the GPU. Built on AVFoundation + CoreImage + Metal — zero CPU pixel processing."
-version: 1.0.0
+version: 1.0.1
 homepage: https://github.com/Syed-Bipul-Rahman/live_beauty_filter
 
 environment:
